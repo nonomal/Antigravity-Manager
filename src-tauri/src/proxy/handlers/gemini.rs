@@ -14,7 +14,7 @@ const MAX_RETRY_ATTEMPTS: usize = 3;
 pub async fn handle_generate(
     State(state): State<AppState>,
     Path(model_action): Path<String>,
-    Json(body): Json<Value>
+    Json(mut body): Json<Value>  // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // 解析 model:method
     let (model_name, method) = if let Some((m, action)) = model_action.rsplit_once(':') {
@@ -59,7 +59,13 @@ pub async fn handle_generate(
             flattened
         });
 
-        let config = crate::proxy::mappers::common_utils::resolve_request_config(&model_name, &mapped_model, &tools_val);
+        let config = crate::proxy::mappers::common_utils::resolve_request_config(
+            &model_name, 
+            &mapped_model, 
+            &tools_val,
+            None,  // size (not applicable for Gemini native protocol)
+            None   // quality
+        );
 
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
@@ -108,76 +114,119 @@ pub async fn handle_generate(
                 let mut buffer = BytesMut::new();
                 let s_id = session_id.clone(); // Clone for stream closure
 
-                let stream = async_stream::stream! {
-                    while let Some(item) = response_stream.next().await {
-                        match item {
-                            Ok(bytes) => {
-                                debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
-                                buffer.extend_from_slice(&bytes);
-                                while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                                    let line_raw = buffer.split_to(pos + 1);
-                                    if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                        let line = line_str.trim();
-                                        if line.is_empty() { continue; }
-                                        
-                                        if line.starts_with("data: ") {
-                                            let json_part = line.trim_start_matches("data: ").trim();
-                                            if json_part == "[DONE]" {
-                                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
-                                                continue;
-                                            }
-                                            
-                                            match serde_json::from_str::<Value>(json_part) {
-                                                Ok(mut json) => {
-                                                    // [FIX #765] Extract thoughtSignature from stream
-                                                    let inner_val = if json.get("response").is_some() {
-                                                        json.get("response")
-                                                    } else {
-                                                        Some(&json)
-                                                    };
+                // [FIX #859] Implement peek logic for Gemini stream to prevent 0-token 200 OK
+                let mut first_chunk = None;
+                let mut retry_gemini = false;
 
-                                                    if let Some(resp) = inner_val {
-                                                        if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
-                                                            for cand in candidates {
-                                                                if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
-                                                                    for part in parts {
-                                                                        if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                                            crate::proxy::SignatureCache::global().cache_session_signature(&s_id, sig.to_string());
-                                                                            debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id);
-                                                                        }
-                                                                    }
+                match tokio::time::timeout(std::time::Duration::from_secs(30), response_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => {
+                        if bytes.is_empty() {
+                            tracing::warn!("[Gemini] Empty first chunk received, retrying...");
+                            retry_gemini = true;
+                        } else {
+                            first_chunk = Some(bytes);
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        tracing::warn!("[Gemini] Stream error during peek: {}, retrying...", e);
+                        last_error = format!("Stream error: {}", e);
+                        retry_gemini = true;
+                    }
+                    Ok(None) => {
+                        tracing::warn!("[Gemini] Stream ended immediately, retrying...");
+                        last_error = "Empty response".to_string();
+                        retry_gemini = true;
+                    }
+                    Err(_) => {
+                        tracing::warn!("[Gemini] Timeout waiting for first chunk, retrying...");
+                        last_error = "Timeout".to_string();
+                        retry_gemini = true;
+                    }
+                }
+
+                if retry_gemini {
+                    continue;
+                }
+
+                let stream = async_stream::stream! {
+                    let mut first_data = first_chunk;
+                    loop {
+                        let item = if let Some(fd) = first_data.take() {
+                            Some(Ok(fd))
+                        } else {
+                            response_stream.next().await
+                        };
+
+                        let bytes = match item {
+                            Some(Ok(b)) => b,
+                            Some(Err(e)) => {
+                                error!("[Gemini-SSE] Connection error: {}", e);
+                                yield Err(format!("Stream error: {}", e));
+                                break;
+                            }
+                            None => break,
+                        };
+
+                        debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
+                        buffer.extend_from_slice(&bytes);
+                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                            let line_raw = buffer.split_to(pos + 1);
+                            if let Ok(line_str) = std::str::from_utf8(&line_raw) {
+                                let line = line_str.trim();
+                                if line.is_empty() { continue; }
+                                
+                                if line.starts_with("data: ") {
+                                    let json_part = line.trim_start_matches("data: ").trim();
+                                    if json_part == "[DONE]" {
+                                        yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                        continue;
+                                    }
+                                    
+                                    match serde_json::from_str::<Value>(json_part) {
+                                        Ok(mut json) => {
+                                            // [FIX #765] Extract thoughtSignature from stream
+                                            let inner_val = if json.get("response").is_some() {
+                                                json.get("response")
+                                            } else {
+                                                Some(&json)
+                                            };
+
+                                            if let Some(resp) = inner_val {
+                                                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
+                                                    for cand in candidates {
+                                                        if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                                            for part in parts {
+                                                                if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
+                                                                    crate::proxy::SignatureCache::global().cache_session_signature(&s_id, sig.to_string());
+                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id);
                                                                 }
                                                             }
                                                         }
                                                     }
-
-                                                    // Unwrap v1internal response wrapper
-                                                    if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                                                        let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
-                                                        yield Ok::<Bytes, String>(Bytes::from(new_line));
-                                                    } else {
-                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
-                                                    yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
                                                 }
                                             }
-                                        } else {
-                                            // Non-data lines (comments, etc.)
+
+                                            // Unwrap v1internal response wrapper
+                                            if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+                                                let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
+                                                yield Ok::<Bytes, String>(Bytes::from(new_line));
+                                            } else {
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
                                             yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
                                         }
-                                    } else {
-                                        // Non-UTF8 data? Just pass it through or skip
-                                        debug!("[Gemini-SSE] Non-UTF8 line encountered");
-                                        yield Ok::<Bytes, String>(line_raw.freeze());
                                     }
+                                } else {
+                                    // Non-data lines (comments, etc.)
+                                    yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
                                 }
-                            }
-                            Err(e) => {
-                                error!("[Gemini-SSE] Connection error: {}", e);
-                                yield Err(format!("Stream error: {}", e));
+                            } else {
+                                // Non-UTF8 data? Just pass it through or skip
+                                debug!("[Gemini-SSE] Non-UTF8 line encountered");
+                                yield Ok::<Bytes, String>(line_raw.freeze());
                             }
                         }
                     }
@@ -188,6 +237,7 @@ pub async fn handle_generate(
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "keep-alive")
+                    .header("X-Accel-Buffering", "no")
                     .header("X-Account-Email", &email)
                     .header("X-Mapped-Model", &mapped_model)
                     .body(body)
@@ -245,6 +295,33 @@ pub async fn handle_generate(
 
             tracing::warn!("Gemini Upstream {} on account {} attempt {}/{}, rotating account", status_code, email, attempt + 1, max_attempts);
             continue;
+        }
+
+        // [NEW] 处理 400 错误 (Thinking 签名失效)
+        if status_code == 400 
+            && (error_text.contains("Invalid `signature`")
+                || error_text.contains("thinking.signature")
+                || error_text.contains("Invalid signature")
+                || error_text.contains("Corrupted thought signature"))
+        {
+            tracing::warn!(
+                "[Gemini] Signature error detected on account {}, retrying without thinking",
+                email
+            );
+            
+            // 追加修复提示词到请求体的最后一条内容
+            if let Some(contents) = body.get_mut("contents").and_then(|v| v.as_array_mut()) {
+                if let Some(last_content) = contents.last_mut() {
+                    if let Some(parts) = last_content.get_mut("parts").and_then(|v| v.as_array_mut()) {
+                        parts.push(json!({
+                            "text": "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block."
+                        }));
+                        tracing::debug!("[Gemini] Appended repair prompt to last content");
+                    }
+                }
+            }
+            
+            continue; // 重试
         }
  
         // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换

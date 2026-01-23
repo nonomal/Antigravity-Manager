@@ -7,6 +7,8 @@ use tauri::{Emitter, Manager};
 pub mod proxy;
 // 导出 autostart 命令
 pub mod autostart;
+// 导出 cloudflared 命令
+pub mod cloudflared;
 
 /// 列出所有账号
 #[tauri::command]
@@ -105,10 +107,18 @@ pub async fn reorder_accounts(account_ids: Vec<String>) -> Result<(), String> {
 
 /// 切换账号
 #[tauri::command]
-pub async fn switch_account(app: tauri::AppHandle, account_id: String) -> Result<(), String> {
+pub async fn switch_account(
+    app: tauri::AppHandle,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<(), String> {
     let res = modules::switch_account(&account_id).await;
     if res.is_ok() {
         crate::modules::tray::update_tray_menus(&app);
+
+        // [FIX #820] Notify proxy to clear stale session bindings and reload accounts
+        // This prevents API requests from routing to the wrong account after switching
+        let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
     }
     res
 }
@@ -776,4 +786,62 @@ pub async fn save_http_api_settings(
     settings: crate::modules::http_api::HttpApiSettings,
 ) -> Result<(), String> {
     crate::modules::http_api::save_settings(&settings)
+}
+
+// ============================================================================
+// Token Statistics Commands
+// ============================================================================
+
+pub use crate::modules::token_stats::{
+    TokenStatsAggregated, AccountTokenStats, TokenStatsSummary
+};
+
+#[tauri::command]
+pub async fn get_token_stats_hourly(hours: i64) -> Result<Vec<TokenStatsAggregated>, String> {
+    crate::modules::token_stats::get_hourly_stats(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_daily(days: i64) -> Result<Vec<TokenStatsAggregated>, String> {
+    crate::modules::token_stats::get_daily_stats(days)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_weekly(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String> {
+    crate::modules::token_stats::get_weekly_stats(weeks)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_by_account(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
+    crate::modules::token_stats::get_account_stats(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_summary(hours: i64) -> Result<TokenStatsSummary, String> {
+    crate::modules::token_stats::get_summary_stats(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_by_model(hours: i64) -> Result<Vec<crate::modules::token_stats::ModelTokenStats>, String> {
+    crate::modules::token_stats::get_model_stats(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_model_trend_hourly(hours: i64) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
+    crate::modules::token_stats::get_model_trend_hourly(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_model_trend_daily(days: i64) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
+    crate::modules::token_stats::get_model_trend_daily(days)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_account_trend_hourly(hours: i64) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
+    crate::modules::token_stats::get_account_trend_hourly(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_account_trend_daily(days: i64) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
+    crate::modules::token_stats::get_account_trend_daily(days)
 }
